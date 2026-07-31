@@ -1,34 +1,46 @@
-"""Minimal, robust solver for the Owocki, Townsend & Quataert (2017)
-photon-tired wind BVP, valid arbitrarily close to the tiring limit
-m -> m_max = 1 - 1/Gamma_0.
+"""Solver for the Owocki, Townsend & Quataert (2017) super-Eddington wind
+boundary-value problem, including mass-loss rates approaching the
+photon-tiring limit m -> m_max = 1 - 1/Gamma_0. See README.md.
 
-Equations (paper App. A, with the eq A1 sign typo fixed):
+Equations (paper App. A; the paper's eq A1 prints +4q*sqrt(w), consistency
+with their variable change q = p/(1-x)^2 requires the minus sign):
     dw/dx = Gamma_0 [1 - m(w+x) - 4 q sqrt(w)] - 1
     dq/dx = -(m Gamma_0 / sqrt(w)) [1 - m(w+x)] + 2q/(1-x) + 4 m Gamma_0 q
-with q = p/(1-x)^2, BCs w(0) = w_sg, q(1) = 0 (via the outer series).
+with boundary conditions w(0) = w_sg and q -> 0 as x -> 1 (both applied a
+small distance inside the endpoints via series expansions, since the
+endpoints themselves are singular).
 
-Method — one idea per regime:
-  * moderate m: direct two-segment matched shoot, unknowns (q0, w1).
-  * near threshold: w1 -> 0 makes (q0, w1) root-finding singular, so swap
-    roles — prescribe w1 and let m float: collocation (solve_bvp) with m as
-    an unknown parameter, in the stretched coordinate xi = -log(1-x), walked
-    geometrically downward in w1 from a moderate-m anchor. m(w1) is smooth
-    and monotone; the target m is located by Illinois secant on log w1.
+Method, by regime:
+  * m/m_max <~ 0.8: matched shooting — integrate from both boundaries to
+    x = 0.5 and root-find on the two unknowns (q0, w1) until the halves
+    agree. (solve_at_m)
+  * larger m: as w1 -> 0 root-finding on w1 becomes ill-conditioned (the
+    outer series has q ~ 1/sqrt(w1)) and shooting fails outright. Swap
+    roles: prescribe w1 and solve for the profile and the m that admits it,
+    via solve_bvp with m as an unknown parameter, in the stretched
+    coordinate xi = -log(1-x). m(w1) is smooth and monotone, so a target m
+    is reached by stepping w1 downward geometrically and refining with a
+    bracketed secant on log w1. Steps must approach a target w1 from above;
+    see solve_at_w1. (solve_at_w1, driven by solve)
 
-Every candidate is validated against the global ODE residual (rejects
-spurious matched-only roots — these do occur).
+Every candidate solution is checked against the governing equations before
+being accepted (ode_residual / residual_ok); the root-finders can converge
+to states that match at x = 0.5 without solving the ODEs globally, and
+those score orders of magnitude worse on this check.
 
-KNOWN LIMIT: collocation node demand grows ~3x per w1 step near the
-threshold (empirically m_max - m ~ sqrt(w1), and the profile becomes
-uniformly harder to resolve as it hugs the marginal Gamma*(tired L) = 1
-state). Practical reach is m/m_max ~ 0.93-0.95, mildly Gamma_0-dependent
-(~0.93 at Gamma_0 = 1.5; ~0.95 at Gamma_0 = 2). solve() raises past its
-reach; closing the last few percent to the tiring limit needs an asymptotic
-(matched-expansion) treatment, not more mesh.
+RANGE OF VALIDITY: solve() works up to m/m_max ~ 0.93-0.95 (weakly
+Gamma_0-dependent: ~0.93 at Gamma_0 = 1.5, ~0.95 at Gamma_0 = 2). Beyond
+that the required mesh resolution grows without bound — the profile hugs
+the marginal state where the photon-tired luminosity exactly balances
+gravity, with m_max - m ~ sqrt(w1) empirically — and solve() raises a
+RuntimeError. Reaching m/m_max -> 1 would need a matched asymptotic
+expansion about the tiring limit, not more mesh.
 
 Public API:
     solve(m, Gamma_0, w_sg=0.0, verbose=False) -> Solution
-    solve_at_w1(w1, Gamma_0, w_sg, guess)      -> Solution (m is an output)
+    solve_at_m(m, Gamma_0, w_sg)               -> Solution or None
+    solve_at_w1(w1, Gamma_0, w_sg, guess)      -> Solution or None (m is an output)
+    ode_residual(sol), residual_ok(sol)
     m_max(Gamma_0), rhs, inner_state, outer_state
 """
 import numpy as np
@@ -130,23 +142,25 @@ def _mismatch(sA, sB):
 
 
 def ode_residual(sol, n=1500, h=1e-7):
-    """Max term-normalized ODE residual of a Solution on a fine grid.
+    """Max ODE residual of a Solution on a fine grid, normalized per-equation
+    by the sum of the magnitudes of that equation's terms.
 
-    Normalized per-equation by the SUM of term magnitudes. (|rhs|-relative
-    norms false-alarm wherever a derivative crosses zero — near-threshold
-    profiles have a flat w peak, and that false alarm is what actually broke
-    the old solver at m/m_max ~ 0.9.) The grid stays in [1e-4, 1-1e-4]: the
-    sqrt(x) Frobenius behavior at the inner edge wrecks the check, and the
-    endpoint zones are the boundary series' responsibility anyway.
+    The sum-of-terms normalization is deliberate: dividing by |dy/dx| instead
+    would spuriously blow up wherever a derivative crosses zero, and w(x)
+    develops a flat interior peak (dw/dx = 0) at large m — genuine solutions
+    would be flagged there. The grid stays inside [1e-4, 1-1e-4]: w ~ sqrt(x)
+    behavior at the inner edge is not resolvable by this check, and the
+    endpoint zones are enforced by the boundary series instead.
 
-    Each solution mode is checked in the coordinates its solver controlled.
-    Matched mode: central differences of the Radau dense output, x-space
-    equations. Collocation mode: the spline's analytic derivative against the
-    xi-space equations — the same ODEs, but (a) finite-differencing a
-    tol~1e-6 interpolant manufactures 1/h-amplified fake residuals, and
-    (b) converting the controlled xi-residual to x-space multiplies it by
-    1/(1-x) (up to 1e4 at the outer edge) while the w-equation's term scale
-    stays O(1), false-rejecting perfectly good solutions."""
+    Each solution mode is checked in the coordinates its solver worked in.
+    Matched shooting: finite differences of the integrator's dense output
+    against the x-space equations. Collocation: the solution spline's
+    analytic derivative against the xi-space equations. The distinction
+    matters — finite-differencing the collocation spline turns its (bounded,
+    acceptable) interpolation error into large spurious residuals, and
+    transforming its xi-space residual into x-space multiplies it by
+    1/(1-x), up to 1e4 at the outer edge of the grid. Either mismatch
+    falsely rejects valid solutions."""
     G = sol.Gamma_0
     m = sol.m
     if sol._bvp_xi is not None:
@@ -182,8 +196,10 @@ def ode_residual(sol, n=1500, h=1e-7):
 
 
 def residual_ok(sol, tol=1e-5):
-    """Gate on the global ODE residual; rejects spurious matched-only roots.
-    True solutions score ~1e-8 (matched) / ~1e-6 (collocation)."""
+    """Accept a candidate only if it satisfies the ODEs globally. Genuine
+    solutions score ~1e-8 (shooting) to ~1e-6 (collocation); false roots —
+    e.g. shooting halves that meet at x = 0.5 without solving the equations
+    elsewhere — score orders of magnitude higher."""
     return ode_residual(sol) < tol
 
 
@@ -233,16 +249,18 @@ def _rhs_xi(xi, y, m, Gamma_0):
 
 
 def solve_at_w1(w1, Gamma_0, w_sg=0.0, guess=None, tol=1e-6, max_nodes=60000):
-    """Prescribed-w1 collocation with m as an unknown parameter.
+    """Solve with w1 prescribed and m as an unknown solve_bvp parameter.
 
-    Regular through w1 -> 0 (no root-find touches the singular q ~ 1/sqrt(w1)
-    direction), and collocation's global linearization avoids the shared-m
-    conditioning wall that stalls shooting-type methods here. Three BCs close
-    the 2-ODE + 1-parameter system: w at the base plus the (w, q) outer series
-    at x = 1 - EPS_OUT, both slaved to the floating m.
+    The 2-ODE + 1-parameter system is closed by three boundary conditions:
+    w at the base, plus the (w, q) outer series values at x = 1 - EPS_OUT,
+    which depend on the floating m. This formulation stays well-conditioned
+    as w1 -> 0, where root-finding on w1 itself breaks down.
 
-    `guess`: a nearby Solution (mesh + profile + m warm start) — required;
-    this is a continuation workhorse, not a cold-start method."""
+    `guess` (required): a nearby Solution supplying the initial profile,
+    mesh, and m. It should have guess.w1 > w1 — solving toward a LARGER w1
+    from a smaller-w1 guess can converge to inaccurate solutions that
+    solve_bvp reports as successful (the residual_ok gate catches these,
+    and a tighter-tolerance retry below usually cannot repair them)."""
     if guess is None:
         return None
     inner_w = w_sg if w_sg > 1e-10 else (Gamma_0 - 1)*EPS_IN
@@ -308,7 +326,8 @@ def solve_at_w1(w1, Gamma_0, w_sg=0.0, guess=None, tol=1e-6, max_nodes=60000):
 
 
 def solve(m, Gamma_0, w_sg=0.0, verbose=False):
-    """Solve the BVP at (m, Gamma_0, w_sg), any m up to the tiring limit."""
+    """Solve the BVP at (m, Gamma_0, w_sg). Works up to m/m_max ~ 0.93-0.95
+    (see module docstring); raises RuntimeError beyond that reach."""
     mm = m_max(Gamma_0)
     if m >= mm:
         raise ValueError(f"m = {m} >= m_max = {mm:.6f}: no escaping wind exists.")
@@ -319,7 +338,8 @@ def solve(m, Gamma_0, w_sg=0.0, verbose=False):
             print(f"  direct: m={m:.6f}, w1={s.w1:.4e}")
         return s
 
-    # Near-threshold: continuation downward in w1, m as output.
+    # m beyond direct shooting's reach: step w1 downward from a moderate-m
+    # solution until the target m is bracketed (m grows as w1 shrinks).
     s0 = None
     for frac in (0.75, 0.6, 0.45):
         m0 = frac*mm
